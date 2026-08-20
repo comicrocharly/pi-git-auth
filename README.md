@@ -36,6 +36,10 @@ TypeScript directly.
 - A `tool_call` hook watches every `bash` invocation. When an active
   account exists and the command runs `git`, the command is rewritten to
   authenticate that account's host (see [git auth](#git-auth)).
+- A `tool_result` hook masks token-shaped strings (GitHub/GitLab PATs,
+  URL-embedded credentials) in **every** tool output before it enters
+  the transcript — an accidental `env` dump or config echo can never
+  print the live token into the conversation.
 
 ## Layout
 
@@ -50,6 +54,7 @@ github.ts    GitHub REST client
 gitlab.ts    GitLab REST client
 details.ts   read-only repo details overlay (tree + commits + metadata)
 git-gate.ts  command rewriting that injects the token for a host
+redact.ts    secret redaction of tool outputs (PAT / URL-credential patterns)
 ```
 
 ## Usage

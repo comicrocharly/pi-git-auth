@@ -1,6 +1,6 @@
 {
   "name": "pi-git-auth",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "pi coding-agent extension: git auth for GitHub and GitLab: keyring-stored login tokens, account switching, transparent git auth, repo list/create with details overlay",
   "license": "MIT",
   "author": "Carlo Onofrio",

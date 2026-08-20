@@ -5,6 +5,7 @@ import { loadStore, activeAccount } from "./store";
 import { SERVICES } from "./forge";
 import { findAccounts, setActiveAccount, statusDetail } from "./auth";
 import { instrumentGit } from "./git-gate";
+import { redactSecrets } from "./redact";
 import { handleAuthCommand } from "./commands";
 
 export default function (pi: ExtensionAPI) {
@@ -18,6 +19,25 @@ export default function (pi: ExtensionAPI) {
     if (!acc?.accessToken) return;
     const host = SERVICES[acc.platform].host;
     event.input.command = instrumentGit(event.input.command, host, acc.accessToken);
+  });
+
+  // ------------------------------------------------------------------
+  // Secret redaction: never let token-shaped strings reach the
+  // transcript. The gate keeps the token out of argv and off disk,
+  // but any bash output (env dump, config echo) would otherwise land
+  // in the session file and the conversation.
+  // ------------------------------------------------------------------
+  pi.on("tool_result", (event) => {
+    let changed = false;
+    const content = event.content.map((block) => {
+      if (block.type !== "text") return block;
+      const text = redactSecrets(block.text);
+      if (text === block.text) return block;
+      changed = true;
+      return { ...block, text };
+    });
+    if (!changed) return;
+    return { content };
   });
 
   // ------------------------------------------------------------------
