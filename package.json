@@ -6,7 +6,7 @@
   "author": "Carlo Onofrio",
   "repository": {
     "type": "git",
-    "url": "https://github.com/comicrocharly/pi-git-auth"
+    "url": "git+https://github.com/comicrocharly/pi-git-auth.git"
   },
   "keywords": [
     "pi-package",
