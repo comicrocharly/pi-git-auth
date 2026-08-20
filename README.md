@@ -1,13 +1,23 @@
 # pi-git-auth
 
 A pi (coding-agent) extension that gives the agent **deterministic git
-authentication** for **GitHub and GitLab**: login tokens are stored, the
-active account is selected in the TUI, and every `git` command the agent
-runs is transparently authenticated with that account's token for its
-host. It also manages accounts and repositories through each service's
-REST API.
+authentication** for **GitHub and GitLab**: login tokens are stored in the
+OS keyring, the active account is selected in the TUI, and every `git`
+command the agent runs is transparently authenticated with that account's
+token for its host. It also manages accounts and repositories through each
+service's REST API.
 
 No npm dependencies — only pi's bundled packages and Node built-ins.
+
+## How it works
+
+- **Login** stores a token per (service, login) pair.
+- One account is **active** at a time. Every action — git auth, repos,
+  create, the LLM tool — uses **the REST API of the active account's
+  service**, so switching accounts also switches the backend.
+- A `tool_call` hook watches every `bash` invocation. When an active
+  account exists and the command runs `git`, the command is rewritten to
+  authenticate that account's host (see [Deterministic git auth](#deterministic-git-auth)).
 
 ## Layout
 
@@ -15,7 +25,8 @@ No npm dependencies — only pi's bundled packages and Node built-ins.
 index.ts     extension entry: git-gate hook, /auth command, `auth` LLM tool
 auth.ts      login/logout/switch flows (per service), status text
 commands.ts  /auth subcommands + interactive TUI menu
-store.ts     multi-account credential persistence (encrypted at rest)
+store.ts     multi-account credential persistence (keyring or file)
+keyring.ts   OS keyring backend (freedesktop Secret Service) + python D-Bus client
 forge.ts     service abstraction: normalized types + GitHub/GitLab registry
 github.ts    GitHub REST client
 gitlab.ts    GitLab REST client
@@ -31,13 +42,11 @@ logout / switch account / repos / create); each action prompts for
 anything missing.
 
 Multiple accounts are supported, across GitHub **and** GitLab. One
-account is **active** at a time. Every action — git auth, repos, create,
-the LLM tool — uses **the REST API of the active account's service**, so
-switching accounts also switches the backend.
+account is **active** at a time.
 
 ### /auth status
-List all stored accounts (service + active marker), plus the active
-account's details (masked token, scopes).
+List all stored accounts (service + active marker), the active storage
+backend, plus the active account's details (masked token, scopes).
 
 ### /auth login
 Pick a service (GitHub or GitLab), then paste a token straight into the
@@ -98,15 +107,58 @@ Forging hosts' git-over-HTTPS endpoints ignore `Authorization` headers
 and only accept URL-embedded credentials, hence the `insteadOf` rewrite.
 Only the active host is touched; other remotes are untouched.
 
-## Storage & performance
+## Token storage
 
-- Credentials: `~/.pi/agent/pi-git-auth/credentials.json` (0600), each
-  token AES-256-GCM encrypted at rest; the key lives in a separate 0600
-  `key` file. Tokens are plaintext only in memory.
-- Performance: the git gate adds one regex pass per `git` command
-  (same as any string rewrite) and no network calls; login adds one TUI
-  prompt. Both services' details views use a single bounded set of REST
-  calls (repo meta + 5 commits + 1 recursive tree).
+Tokens are **never stored plaintext on disk**. Two backends are
+available; the extension picks one at load time.
+
+### OS keyring (preferred)
+The token lives in the session keyring, addressed by the
+[freedesktop Secret Service API](https://specifications.freedesktop.org/secret-service/)
+(`org.freedesktop.secrets` over D-Bus). This covers KWallet (via
+`ksecretd`), GNOME Keyring, KeePassXC, and any other Secret Service
+provider.
+
+- The embedded python3 client (a small script that `keyring.ts` keeps
+  in sync in the state dir) opens a D-Bus session and talks
+  **JSON over stdin/stdout**. The token therefore never appears in a
+  process argument list — only in the parent's memory.
+- The client **auto-detects the Secret Service API generation** by
+  introspecting the service: modern 0.0.1
+  (`Store`/`GetSecret`) for gnome-keyring / `kwallet --secretservice`,
+  or legacy 0.0.0 (`Collection.CreateItem`/`GetSecrets`) for KDE
+  `ksecretd`. Both are implemented.
+- `credentials.json` keeps only a `wallet:v1:<accountKey>` marker per
+  account; the token itself is in the keyring.
+
+### Encrypted file (fallback)
+When python3 / D-Bus / a keyring are unavailable (headless server, no
+session bus), the extension transparently falls back to an on-disk
+AES-256-GCM envelope:
+
+- `~/.pi/agent/pi-git-auth/credentials.json` (0600) holds each token as
+  an `enc:v1:<base64>` envelope.
+- The key lives in a separate 0600 `key` file (0700 dir).
+
+### Migration
+Moving from the old plaintext/`enc:v1:` layout to the keyring is
+transparent. On first load, any legacy token is read, written to the
+keyring, and the file is rewritten with `wallet:v1:` markers. A `.bak`
+copy of the pre-migration file is kept (ciphertext/markers only, no
+plaintext).
+
+### Override
+`PI_GIT_AUTH_STORE` forces the backend: `auto` (default — keyring when
+reachable, else file), `wallet`, or `file`.
+
+## Performance
+
+- The git gate adds one regex pass per `git` command (same as any string
+  rewrite) and no network calls; login adds one TUI prompt.
+- The keyring round-trip is one D-Bus exchange per account, only at load
+  and write time.
+- Both services' details views use a single bounded set of REST calls
+  (repo meta + 5 commits + 1 recursive tree).
 
 ## Limits
 
@@ -115,3 +167,5 @@ Only the active host is touched; other remotes are untouched.
 - GitLab does not expose project size or per-file sizes via this API;
   the details overlay simply omits them.
 - GitLab project list for an org tries the group first, then a user.
+- Keyring storage requires a D-Bus session bus and a Secret Service
+  provider; otherwise the encrypted-file fallback is used.
