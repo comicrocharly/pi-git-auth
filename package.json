@@ -1,0 +1,40 @@
+{
+  "name": "pi-git-auth",
+  "version": "1.0.0",
+  "description": "pi coding-agent extension: git auth for GitHub and GitLab: keyring-stored login tokens, account switching, transparent git auth, repo list/create with details overlay",
+  "license": "MIT",
+  "author": "Carlo Onofrio",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/comicrocharly/pi-git-auth"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "git",
+    "git-auth",
+    "github",
+    "gitlab",
+    "keyring"
+  ],
+  "files": [
+    "*.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -17,7 +17,7 @@ No npm dependencies — only pi's bundled packages and Node built-ins.
   service**, so switching accounts also switches the backend.
 - A `tool_call` hook watches every `bash` invocation. When an active
   account exists and the command runs `git`, the command is rewritten to
-  authenticate that account's host (see [Deterministic git auth](#deterministic-git-auth)).
+  authenticate that account's host (see [git auth](#git-auth)).
 
 ## Layout
 
