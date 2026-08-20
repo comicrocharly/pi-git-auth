@@ -52,8 +52,8 @@ backend, plus the active account's details (masked token, scopes).
 Pick a service (GitHub or GitLab), then paste a token straight into the
 TUI — the token-creation page is opened in the browser.
 
-- GitHub: `ghp_…` PAT, `github_pat_…` fine-grained, or classic
-  `gho_…`/`ghs_…` (scopes: `repo`, `user:email`).
+- GitHub: classic PAT `ghp_…` (scopes: `repo`, `user:email`) or a
+  fine-grained `github_pat_…` token.
 - GitLab: personal access token `glpat-…` (scope: `api`).
 
 Verified against the service (`GET /user` / `GET /api/v4/user`) before
@@ -157,8 +157,9 @@ reachable, else file), `wallet`, or `file`.
   rewrite) and no network calls; login adds one TUI prompt.
 - The keyring round-trip is one D-Bus exchange per account, only at load
   and write time.
-- Both services' details views use a single bounded set of REST calls
-  (repo meta + 5 commits + 1 recursive tree).
+- GitHub's details view uses a single bounded set of REST calls
+  (repo meta + 5 commits + 1 recursive tree). GitLab's tree is top-level
+  only (its API does not recurse), bounded to 100 entries.
 
 ## Limits
 
@@ -166,6 +167,8 @@ reachable, else file), `wallet`, or `file`.
 - GitLab: `gitlab.com` only (no self-hosted instances).
 - GitLab does not expose project size or per-file sizes via this API;
   the details overlay simply omits them.
+- GitLab's repository tree is top-level only (the API ignores `recursive`),
+  so nested directories are not listed in the details overlay.
 - GitLab project list for an org tries the group first, then a user.
 - Keyring storage requires a D-Bus session bus and a Secret Service
   provider; otherwise the encrypted-file fallback is used.
