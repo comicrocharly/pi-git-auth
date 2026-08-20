@@ -9,6 +9,24 @@ service's REST API.
 
 No npm dependencies — only pi's bundled packages and Node built-ins.
 
+## Install
+
+As a pi package:
+
+```
+pi install npm:pi-git-auth
+```
+
+Or from git:
+
+```
+pi install git:github.com/comicrocharly/pi-git-auth
+```
+
+Or manually: copy the `.ts` files into
+`~/.pi/agent/extensions/pi-git-auth/`. No build step — pi loads the
+TypeScript directly.
+
 ## How it works
 
 - **Login** stores a token per (service, login) pair.
