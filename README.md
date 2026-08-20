@@ -1,7 +1,7 @@
 # pi-git-auth
 
-A pi (coding-agent) extension that gives the agent **git forges 
-authentication** for **GitHub and GitLab**: login tokens are stored in the
+A [pi](https://github.com/badlogic/pi-mono) (coding-agent) extension that 
+gives the agent **git forges authentication** for **GitHub and GitLab**: login tokens are stored in the
 OS keyring, the active account is selected in the TUI, and every `git`
 command the agent runs is transparently authenticated with that account's
 token for its host. It also manages accounts and repositories through each
@@ -190,3 +190,10 @@ reachable, else file), `wallet`, or `file`.
 - GitLab project list for an org tries the group first, then a user.
 - Keyring storage requires a D-Bus session bus and a Secret Service
   provider; otherwise the encrypted-file fallback is used.
+
+## About pi
+
+This extension is built for [pi](https://github.com/badlogic/pi-mono),
+the minimal, coding-agent-first terminal agent by Mario Zechner.
+See the pi repo for docs on the extension and package system this
+extension plugs into.
