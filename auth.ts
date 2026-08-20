@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { loadStore, saveStore, maskToken, activeAccount, accountKey, type StoreData } from "./store";
+import { loadStore, saveStore, maskToken, activeAccount, accountKey, purgeAccountStorage, storeBackend, type StoreData } from "./store";
 import { SERVICES, type Platform, type Service } from "./forge";
 
 /** The subset of ctx.ui the auth flows need. */
@@ -76,7 +76,9 @@ export async function loginWithPastedToken(ui: UiLike, service: Service): Promis
  */
 export function removeAccount(key: string): void {
   const data = loadStore();
+  const rec = data.accounts[key];
   delete data.accounts[key];
+  purgeAccountStorage(key, rec); // drop the keyring item, if any
   if (data.activeLogin === key) {
     const rest = Object.keys(data.accounts);
     data.activeLogin = rest.length > 0 ? rest[0] : undefined;
@@ -129,6 +131,9 @@ export function statusDetail(data: StoreData): string {
     );
   }
   const activeKey = data.activeLogin;
+  if (activeKey) lines.push("");
+  lines.push(`Store: ${storeBackend() === "keyring" ? "OS keyring (Secret Service)" : "encrypted file"}`);
+  if (activeKey) lines.push("");
   const active = activeKey ? data.accounts[activeKey] : undefined;
   if (active && activeKey) {
     lines.push("");
