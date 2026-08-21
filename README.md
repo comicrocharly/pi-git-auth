@@ -2,8 +2,8 @@
 
 A [pi](https://github.com/badlogic/pi-mono) (coding-agent) extension that 
 gives the agent **git forges authentication** for **GitHub and GitLab**: login tokens are stored in the
-OS keyring, the active account is selected in the TUI, and every `git`
-command the agent runs is transparently authenticated with that account's
+OS keyring, switch account, and every `git`command 
+the agent runs is transparently authenticated with that account's
 token for its host. It also manages accounts and repositories through each
 service's REST API.
 
