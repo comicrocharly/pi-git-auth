@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { loadStore, saveStore, maskToken, activeAccount, accountKey, purgeAccountStorage, storeBackend, type StoreData } from "./store";
+import { loadStore, saveStore, maskToken, activeAccount, accountKey, purgeAccountStorage, storeBackend, keyringUnavailableAtLoadFlag, type StoreData } from "./store";
 import { SERVICES, type Platform, type Service } from "./forge";
 
 /** The subset of ctx.ui the auth flows need. */
@@ -132,13 +132,21 @@ export function statusDetail(data: StoreData): string {
   }
   const activeKey = data.activeLogin;
   if (activeKey) lines.push("");
-  lines.push(`Store: ${storeBackend() === "keyring" ? "OS keyring (Secret Service)" : "encrypted file"}`);
+  const backend = storeBackend() === "keyring" ? "OS keyring (Secret Service)" : "encrypted file";
+  const kwLocked = storeBackend() === "keyring" && keyringUnavailableAtLoadFlag();
+  lines.push(`Store: ${backend}${kwLocked ? " (locked/unreachable on load)" : ""}`);
   if (activeKey) lines.push("");
   const active = activeKey ? data.accounts[activeKey] : undefined;
   if (active && activeKey) {
     lines.push("");
     lines.push(`Active: @${active.user ?? activeKey.slice(activeKey.indexOf(":") + 1)}  (${active.platform})`);
-    lines.push(`Token: ${maskToken(active.accessToken)}`);
+    if (!active.accessToken && kwLocked) {
+      lines.push(
+        "Token: (none) — keyring locked: the token is stored in the keyring and is available again once the wallet unlocks (git auth is disabled meanwhile)"
+      );
+    } else {
+      lines.push(`Token: ${maskToken(active.accessToken)}`);
+    }
     if (active.scopes) lines.push(`Scopes: ${active.scopes}`);
     lines.push(`Saved: ${active.savedAt}`);
   }

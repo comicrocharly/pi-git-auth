@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import type { Platform } from "./forge";
-import { STATE_DIR, walletAvailable, walletStore, walletLookup, walletClear, walletAttrs } from "./keyring";
+import { STATE_DIR, walletAvailable, walletUpsert, walletLookup, walletAttrs } from "./keyring";
 
 /**
  * Credential persistence for pi-git-auth (multi-account, multi-service).
@@ -67,6 +67,12 @@ export interface StoreData {
 
 let cache: StoreData | null = null;
 let keyCache: Buffer | null = null;
+/** Stored strings (markers/envelopes) from the last file read/write. */
+let diskData: StoreData | null = null;
+/** Plaintext tokens as last persisted, per account key ("" = unreadable). */
+let storedPlaintext: Record<string, string> = {};
+/** A `wallet:v1:` token could not be read on load (keyring locked/absent). */
+let keyringUnavailableAtLoad = false;
 
 const ENC_PREFIX = "enc:v1:";
 const WALLET_PREFIX = "wallet:v1:";
@@ -163,22 +169,35 @@ function decryptToken(enc: string): string {
 // Store API
 // ---------------------------------------------------------------------------
 
-function persist(data: StoreData): void {
-  // The in-memory copy holds plaintext; for each account the token is
-  // stored in the backend and the file keeps only a marker/envelope.
+/**
+ * Persist the in-memory (plaintext) state. Only accounts whose token
+ * changed since the last persist are (re)written to the backend; the
+ * others keep their on-disk marker/envelope untouched. This matters on
+ * KDE/ksecretd: a keyring write is the only operation that may trigger
+ * the KWallet unlock dialog, so e.g. `/auth switch` performs zero
+ * keyring writes (no prompts, no "repeated wallet access" warnings).
+ * When the keyring is locked/unreachable the token is kept in the
+ * encrypted file instead of leaving a dead `wallet:v1:` marker behind.
+ */
+function persist(data: StoreData, forceStore = false): void {
   const mode = storeMode();
   const accounts: Record<string, AccountRecord> = {};
+  const nowPlaintext: Record<string, string> = {};
   for (const [k, a] of Object.entries(data.accounts)) {
+    const changed = forceStore || storedPlaintext[k] !== a.accessToken;
+    const diskStored = diskData?.accounts[k]?.accessToken;
     let stored: string;
-    if (mode === "wallet") {
-      // Clear-then-store keeps the keyring free of duplicate items.
-      const attrs = recAttrs(a, k);
-      walletClear(attrs);
-      stored = walletStore(attrs, a.accessToken) ? WALLET_PREFIX + k : encryptToken(a.accessToken);
+    if (changed && a.accessToken) {
+      // Single keyring roundtrip (delete matching items + create).
+      const r = mode === "wallet" ? walletUpsert(recAttrs(a, k), a.accessToken) : null;
+      stored = r === "ok" ? WALLET_PREFIX + k : encryptToken(a.accessToken);
+    } else if (diskStored) {
+      stored = diskStored; // unchanged: keep the existing marker/envelope
     } else {
-      stored = encryptToken(a.accessToken);
+      stored = a.accessToken ? encryptToken(a.accessToken) : "";
     }
     accounts[k] = { ...a, accessToken: stored };
+    nowPlaintext[k] = a.accessToken;
   }
   const out: StoreData = {
     accounts,
@@ -189,6 +208,9 @@ function persist(data: StoreData): void {
   writeFileSync(tmp, JSON.stringify(out, null, 2) + "\n", { mode: 0o600 });
   renameSync(tmp, CREDENTIALS_FILE);
   chmodSync(CREDENTIALS_FILE, 0o600);
+  diskData = out;
+  storedPlaintext = nowPlaintext;
+  cache = data;
 }
 
 export function loadStore(): StoreData {
@@ -201,6 +223,11 @@ export function loadStore(): StoreData {
   } catch {
     raw = {};
   }
+  // Deep snapshot BEFORE absorb() mutates records in place — diskData must
+  // keep the on-disk stored strings (markers/envelopes), never the
+  // plaintext tokens that absorb decrypts into the same objects.
+  diskData = raw.accounts && typeof raw.accounts === "object" ? JSON.parse(JSON.stringify(raw)) : null;
+  keyringUnavailableAtLoad = false;
   const data: StoreData = { accounts: {} };
   let migrated = false;
 
@@ -209,7 +236,10 @@ export function loadStore(): StoreData {
     if (rec.accessToken.startsWith(WALLET_PREFIX)) {
       const got = walletLookup(recAttrs(rec, key));
       if (got === null) {
-        rec.accessToken = ""; // keyring unreachable/cleared: don't crash, don't leak
+        // keyring locked/cleared: keep the marker on disk, run this
+        // process without the token, and flag it for the status output.
+        rec.accessToken = "";
+        keyringUnavailableAtLoad = true;
       } else {
         rec.accessToken = got;
       }
@@ -229,6 +259,7 @@ export function loadStore(): StoreData {
       migrated = true;
     }
     data.accounts[key] = rec as AccountRecord;
+    storedPlaintext[key] = (rec as AccountRecord).accessToken;
   };
 
   if (raw.accounts && typeof raw.accounts === "object") {
@@ -253,7 +284,7 @@ export function loadStore(): StoreData {
       // Keep a rollback copy of the pre-migration file (still 0600, no
       // new secrets — it only contains ciphertexts/markers).
       if (hadFile && existsSync(CREDENTIALS_FILE)) copyFileSync(CREDENTIALS_FILE, CREDENTIALS_FILE + ".bak");
-      persist(cache);
+      persist(cache, true); // force re-store under the current backend
     } catch {
       /* best-effort migration */
     }
@@ -262,14 +293,20 @@ export function loadStore(): StoreData {
 }
 
 export function saveStore(data: StoreData): void {
-  cache = data;
   persist(data);
+}
+
+/** True when a `wallet:v1:` token could not be read on load (keyring
+ *  locked or unreachable) — the in-memory token for that account is "". */
+export function keyringUnavailableAtLoadFlag(): boolean {
+  return keyringUnavailableAtLoad;
 }
 
 /** Remove one account's keyring item (idempotent, best-effort). */
 export function purgeAccountStorage(key: string, rec?: AccountRecord | null): void {
   try {
-    if (rec) walletClear(recAttrs(rec, key));
+    // Empty secret = delete-only: best-effort, never triggers a prompt.
+    if (rec) walletUpsert(recAttrs(rec, key), "");
   } catch {
     /* best-effort */
   }
@@ -280,13 +317,15 @@ export function clearStore(): void {
   try {
     if (cache) {
       for (const [k, rec] of Object.entries(cache.accounts)) {
-        walletClear(recAttrs(rec, k));
+        walletUpsert(recAttrs(rec, k), "");
       }
     }
   } catch {
     /* best-effort */
   }
   cache = { accounts: {} };
+  diskData = null;
+  storedPlaintext = {};
   try {
     rmSync(CREDENTIALS_FILE);
   } catch {

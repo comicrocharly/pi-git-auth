@@ -154,6 +154,28 @@ provider.
 - `credentials.json` keeps only a `wallet:v1:<accountKey>` marker per
   account; the token itself is in the keyring.
 
+#### KDE Plasma (KWallet / ksecretd)
+
+`ksecretd` fires a KWallet unlock dialog for **every** D-Bus operation on
+a locked collection, so the client is built to keep wallet access to the
+absolute minimum:
+
+- **Lookup never prompts.** A read on a locked collection returns
+  `locked` without touching the collection — no stacked prompts, no kded
+  "Repeated attempts to access a wallet have occurred" warning.
+- **Store is a single roundtrip** (delete matching items + create the new
+  one, at most one unlock attempt) and only runs when a token actually
+  changed. `/auth switch`, `status`, and plain git use perform **zero**
+  keyring writes.
+- **When the wallet is locked (or the keyring is otherwise unreachable)
+  while writing**, the token is transparently kept in the encrypted file
+  instead of leaving a dead `wallet:v1:` marker — the token stays
+  available. Once the wallet unlocks, the next token change moves it back
+  into the keyring.
+- If the wallet is locked when pi starts, the in-memory token is empty for
+  that session (git auth is disabled meanwhile) and `/auth status` says so
+  explicitly instead of showing a bare `(none)`.
+
 ### Encrypted file (fallback)
 When python3 / D-Bus / a keyring are unavailable (headless server, no
 session bus), the extension transparently falls back to an on-disk
@@ -178,8 +200,9 @@ reachable, else file), `wallet`, or `file`.
 
 - The git gate adds one regex pass per `git` command (same as any string
   rewrite) and no network calls; login adds one TUI prompt.
-- The keyring round-trip is one D-Bus exchange per account, only at load
-  and write time.
+- The keyring round-trip is one D-Bus exchange per account at load, and a
+  single upsert roundtrip **only for accounts whose token changed** at
+  write time (a `/auth switch` writes no keyring at all).
 - GitHub's details view uses a single bounded set of REST calls
   (repo meta + 5 commits + 1 recursive tree). GitLab's tree is top-level
   only (its API does not recurse), bounded to 100 entries.

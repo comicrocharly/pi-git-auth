@@ -8,11 +8,23 @@
  * It talks JSON over stdin/stdout, which means the secret NEVER appears in
  * a process argument list — only in the parent process's memory.
  *
+ * KWallet/ksecretd (KDE Plasma) notes:
+ *   - ksecretd triggers a KWallet unlock dialog for every D-Bus operation
+ *     on a LOCKED collection. To keep this from stacking prompts (and
+ *     tripping kded's "Repeated attempts to access a wallet have
+ *     occurred" warning):
+ *       * "lookup" on a locked collection returns {"locked": true} and
+ *         never touches the collection;
+ *       * "upsert" does delete+create in ONE D-Bus roundtrip with at most
+ *         ONE explicit unlock attempt (only when a non-empty secret is
+ *         actually being written);
+ *       * delete-only ("clear" / empty secret) never unlocks.
+ *
  * Two API generations are auto-detected at runtime by introspection:
  *   - modern 0.0.1 (gnome-keyring, kwallet --secretservice):
  *       Service.Store / SearchItems / item.GetSecret
  *   - legacy 0.0.0 (KDE ksecretd, default with KWallet 6):
- *       Collection.CreateItem / Service.SearchItems / Service.GetSecrets
+ *       Collection.CreateItem / SearchItems / Service.GetSecrets
  *
  * Fallback: when python3/dbus/keyring are unavailable (headless, no D-Bus),
  * store.ts silently keeps the on-disk AES-encrypted file format.
@@ -26,10 +38,14 @@ export const STATE_DIR = join(homedir(), ".pi", "agent", "pi-git-auth");
 const PY_PATH = join(STATE_DIR, "wallet-tool.py");
 const TIMEOUT_MS = 8000;
 
+/** Outcome of a keyring write: ok, keyring locked, or unreachable. */
+export type WalletResult = "ok" | "locked" | "unreachable";
+
 interface WalletRes {
   ok: boolean;
   secret?: string;
   api?: string;
+  locked?: boolean;
   error?: string;
 }
 
@@ -38,12 +54,22 @@ const PY = `#!/usr/bin/env python3
 
 Protocol: one JSON request on stdin, one JSON response line on stdout.
   {"cmd": "available"}
-  {"cmd": "store",  "attrs": {...}, "secret": "..."}
+  {"cmd": "upsert", "attrs": {...}, "secret": "..."}   # empty secret = delete only
   {"cmd": "lookup", "attrs": {...}}
   {"cmd": "clear",  "attrs": {...}}
 
 Auto-detects the Secret Service API generation (modern 0.0.1 vs legacy
 0.0.0/ksecretd) by introspecting the service.
+
+KWallet/ksecretd (KDE) note: every D-Bus operation on a LOCKED collection
+triggers a KWallet unlock dialog. So:
+  - "lookup" on a locked collection returns {"locked": true} and never
+    touches the collection;
+  - "upsert" does delete+create in ONE roundtrip with at most ONE explicit
+    unlock attempt, and only when a non-empty secret is written;
+  - delete-only never unlocks.
+This keeps the client from stacking unlock prompts, which is what makes
+kded warn "Repeated attempts to access a wallet have occurred".
 """
 import sys
 import json
@@ -114,12 +140,12 @@ def main():
             if str(coll) == "/":
                 out({"ok": False, "error": "no default collection in keyring"})
                 return
-            try:
-                dbusi.Unlock([coll])
-            except Exception:
-                pass
 
         def find_items():
+            """Return (item paths in unlocked collections, locked flag).
+            legacy ksecretd reports items in LOCKED collections separately;
+            touching them would fire KWallet unlock dialogs, so callers
+            get the flag instead."""
             if MODERN:
                 res = dbusi.SearchItems(
                     dbus.UInt32(0),
@@ -128,11 +154,11 @@ def main():
                     ),
                     dbus.ObjectPath("/"),
                 )
-                return [str(k) for k in res]
-            (u, _l) = dbusi.SearchItems(dbus.Dictionary(
+                return [str(k) for k in res], False
+            (u, locked) = dbusi.SearchItems(dbus.Dictionary(
                 {k: v for k, v in attrs.items()}, "ss"
             ))
-            return [str(k) for k in list(u) + list(_l)]
+            return [str(k) for k in list(u)], bool(locked)
 
         def get_content(path):
             """Return the secret bytes for an item path, or None."""
@@ -171,7 +197,32 @@ def main():
             except Exception:
                 pass
 
-        if cmd == "store":
+        if cmd in ("upsert", "store", "clear"):
+            paths, is_locked = find_items()
+            writing = cmd != "clear" and bool(secret)
+            if is_locked:
+                if not writing:
+                    # delete-only on a locked keyring: skip it rather than
+                    # prompt (best-effort purge; the file is already clean).
+                    out({"ok": False, "locked": True,
+                         "error": "keyring is locked"})
+                    return
+                # writing while locked: exactly ONE unlock attempt (one
+                # prompt), then re-check.
+                try:
+                    dbusi.Unlock([coll])
+                except Exception:
+                    pass
+                paths, is_locked = find_items()
+                if is_locked:
+                    out({"ok": False, "locked": True,
+                         "error": "keyring is locked"})
+                    return
+            for path in paths:
+                item_delete(path)
+            if cmd == "clear" or not secret:
+                out({"ok": True})
+                return
             if MODERN:
                 item = "/org/freedesktop/secrets/0/item/" + re.sub(
                     r"[^A-Za-z0-9_]", "_", "%s_%s" % (
@@ -213,7 +264,7 @@ def main():
                 )
             else:
                 coll_obj = dbus.Interface(
-                    bus.get_object(owner, str(dbusi.ReadAlias("default"))),
+                    bus.get_object(owner, str(coll)),
                     "org.freedesktop.Secret.Collection",
                 )
                 secret_arg = dbus.Struct((
@@ -236,7 +287,8 @@ def main():
             return
 
         if cmd == "lookup":
-            for path in find_items():
+            paths, is_locked = find_items()
+            for path in paths:
                 content = get_content(path)
                 if content:
                     out({
@@ -244,13 +296,13 @@ def main():
                         "secret": content.decode("utf-8", "replace"),
                     })
                     return
+            if is_locked:
+                # Item exists but its collection is locked (KWallet):
+                # report it, don't touch the collection (no unlock prompt).
+                out({"ok": False, "locked": True,
+                     "error": "keyring is locked"})
+                return
             out({"ok": False, "error": "item not found"})
-            return
-
-        if cmd == "clear":
-            for path in find_items():
-                item_delete(path)
-            out({"ok": True})
             return
 
         out({"ok": False, "error": "unknown command"})
@@ -319,20 +371,35 @@ export function walletAvailable(): boolean {
   return availCache;
 }
 
-/** Store (upsert) a secret. */
-export function walletStore(attrs: Record<string, string>, secret: string): boolean {
-  const r = call({ cmd: "store", attrs, secret });
-  return !!(r && r.ok);
+let lastLookupLocked = false;
+
+/**
+ * Upsert a secret for the given attrs in ONE D-Bus roundtrip: existing
+ * matching items are deleted, then (when secret is non-empty) the new item
+ * is created. An empty secret deletes only (best-effort, never prompts).
+ * "locked" = the keyring exists but is locked (KWallet): the token must be
+ * kept in the file fallback; "unreachable" = no keyring/D-Bus at all.
+ */
+export function walletUpsert(attrs: Record<string, string>, secret: string): WalletResult {
+  const r = call({ cmd: "upsert", attrs, secret });
+  if (!r) return "unreachable";
+  if (r.ok) return "ok";
+  if (r.locked) return "locked";
+  return "unreachable";
 }
 
-/** Read a secret; null when not found or the keyring is unreachable. */
+/**
+ * Read a secret; null when not found, the keyring is locked, or the
+ * keyring is unreachable. See walletWasLocked() to distinguish a locked
+ * keyring from a missing item.
+ */
 export function walletLookup(attrs: Record<string, string>): string | null {
   const r = call({ cmd: "lookup", attrs });
+  lastLookupLocked = !!(r && r.locked);
   return r && r.ok ? (r.secret ?? null) : null;
 }
 
-/** Remove every item matching attrs. No-op when none exist. */
-export function walletClear(attrs: Record<string, string>): boolean {
-  const r = call({ cmd: "clear", attrs });
-  return !!(r && r.ok);
+/** True when the last lookup failed because the keyring is locked. */
+export function walletWasLocked(): boolean {
+  return lastLookupLocked;
 }
