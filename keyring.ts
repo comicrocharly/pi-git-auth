@@ -76,10 +76,12 @@ KWallet/ksecretd (KDE) note: every D-Bus operation on a LOCKED collection
 triggers a KWallet unlock dialog. So:
   - "lookup" on a locked collection returns {"locked": true} and never
     touches the collection;
-  - "upsert" does delete+create in ONE roundtrip with at most ONE explicit
-    unlock attempt, and only when a non-empty secret is written; it then
-    waits "wait" seconds for the interactive unlock to complete (ksecretd's
-    Unlock returns immediately, so one recheck is not enough);
+  - "upsert" creates the new item (with its secret) FIRST and only then
+    deletes the previously matched ones — kill-safe: an interrupted upsert
+    never destroys the keyring copy; at most ONE explicit unlock attempt,
+    and only when a non-empty secret is written; it then waits "wait"
+    seconds for the interactive unlock to complete (ksecretd's Unlock
+    returns immediately, so one recheck is not enough);
   - delete-only never unlocks.
 This keeps the client from stacking unlock prompts, which is what makes
 kded warn "Repeated attempts to access a wallet have occurred".
@@ -242,11 +244,17 @@ def main():
                     out({"ok": False, "locked": True,
                          "error": "keyring is locked"})
                     return
-            for path in paths:
-                item_delete(path)
             if cmd == "clear" or not secret:
+                for path in paths:
+                    item_delete(path)
                 out({"ok": True})
                 return
+            # Kill-safe order: create the new item (with its secret) first,
+            # then delete the previously matched items. Even if this process
+            # is killed mid-upsert the keyring copy is never destroyed
+            # (worst case: orphan items remain; the next upsert cleans them
+            # up, and lookups take the first non-empty secret).
+            new_path = ""
             if MODERN:
                 item = "/org/freedesktop/secrets/0/item/" + re.sub(
                     r"[^A-Za-z0-9_]", "_", "%s_%s" % (
@@ -286,6 +294,7 @@ def main():
                         "sv",
                     ),
                 )
+                new_path = item
             else:
                 coll_obj = dbus.Interface(
                     bus.get_object(owner, str(coll)),
@@ -306,7 +315,13 @@ def main():
                             {k: v for k, v in attrs.items()}, "ss"
                         ),
                 }, "sv")
-                coll_obj.CreateItem(props, secret_arg, True)
+                create_res = coll_obj.CreateItem(props, secret_arg, True)
+                if create_res and len(create_res) > 1:
+                    new_path = str(create_res[1])
+            for path in paths:
+                if path == new_path:
+                    continue
+                item_delete(path)
             out({"ok": True})
             return
 
@@ -398,9 +413,10 @@ export function walletAvailable(): boolean {
 let lastLookupLocked = false;
 
 /**
- * Upsert a secret for the given attrs in ONE D-Bus roundtrip: existing
- * matching items are deleted, then (when secret is non-empty) the new item
- * is created. An empty secret deletes only (best-effort, never prompts).
+ * Upsert a secret for the given attrs in ONE D-Bus roundtrip: the new item
+ * is created (with its secret) first, then the previously matched items are
+ * deleted — an interrupted upsert never destroys the keyring copy. An empty
+ * secret deletes only (best-effort, never prompts).
  * `waitSec` is how long to wait for an interactive unlock when the
  * keyring is locked while writing (default UNLOCK_WAIT_S for interactive
  * callers such as login; pass 0 for non-interactive paths so they fall
@@ -409,7 +425,7 @@ let lastLookupLocked = false;
  * "unreachable" = no keyring/D-Bus at all.
  */
 export function walletUpsert(attrs: Record<string, string>, secret: string, waitSec = UNLOCK_WAIT_S): WalletResult {
-  const r = call({ cmd: "upsert", attrs, secret, wait: waitSec }, UPSERT_TIMEOUT_MS);
+  const r = call({ cmd: "upsert", attrs, secret, wait: waitSec }, Math.max(UPSERT_TIMEOUT_MS, (waitSec + 15) * 1000));
   if (!r) return "unreachable";
   if (r.ok) return "ok";
   if (r.locked) return "locked";
