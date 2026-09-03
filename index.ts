@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { loadStore, activeAccount } from "./store";
+import { loadStore, activeAccount, retryKeyringLoad } from "./store";
 import { SERVICES } from "./forge";
 import { findAccounts, setActiveAccount, statusDetail } from "./auth";
 import { instrumentGit } from "./git-gate";
@@ -15,6 +15,7 @@ export default function (pi: ExtensionAPI) {
   // ------------------------------------------------------------------
   pi.on("tool_call", async (event, ctx) => {
     if (!isToolCallEventType("bash", event)) return;
+    retryKeyringLoad(); // prompt-safe: recovers the token once the wallet unlocks
     const acc = activeAccount(loadStore());
     if (!acc?.accessToken) return;
     const host = SERVICES[acc.platform].host;
@@ -86,6 +87,7 @@ export default function (pi: ExtensionAPI) {
 
       switch (params.action) {
         case "status": {
+          retryKeyringLoad(); // prompt-safe: recovers the token once the wallet unlocks
           const data = loadStore();
           if (Object.keys(data.accounts).length === 0) return { ...text(notConnected), isError: true };
           return text(statusDetail(data));

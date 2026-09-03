@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import type { Platform } from "./forge";
-import { STATE_DIR, walletAvailable, walletUpsert, walletLookup, walletAttrs } from "./keyring";
+import { STATE_DIR, walletAvailable, walletUpsert, walletLookup, walletAttrs, UNLOCK_WAIT_S } from "./keyring";
 
 /**
  * Credential persistence for pi-git-auth (multi-account, multi-service).
@@ -20,6 +20,15 @@ import { STATE_DIR, walletAvailable, walletUpsert, walletLookup, walletAttrs } f
  *
  * Migration is transparent: legacy plaintext or `enc:v1:` tokens are moved
  * into the keyring on first load (a `.bak` copy of the file is kept).
+ * This is also the self-heal: a token kept in the file after a locked
+ * wallet goes back to the keyring on the next load while it is reachable
+ * (load-time writes use wait=0, so a still-locked wallet never delays
+ * startup).
+ *
+ * If the keyring is locked on load, the token for `wallet:v1:` accounts
+ * is "" for this process but is retried (throttled, prompt-safe) via
+ * retryKeyringLoad() on the next status/git-gate hit, so it recovers
+ * automatically once the wallet unlocks.
  *
  * Env override: PI_GIT_AUTH_STORE = auto (default) | wallet | file
  *
@@ -73,6 +82,10 @@ let diskData: StoreData | null = null;
 let storedPlaintext: Record<string, string> = {};
 /** A `wallet:v1:` token could not be read on load (keyring locked/absent). */
 let keyringUnavailableAtLoad = false;
+/** Accounts with a `wallet:v1:` marker that failed to read on load. */
+let loadFailedKeys: string[] = [];
+let lastRetryAt = 0;
+const RETRY_THROTTLE_MS = 10_000;
 
 const ENC_PREFIX = "enc:v1:";
 const WALLET_PREFIX = "wallet:v1:";
@@ -178,8 +191,13 @@ function decryptToken(enc: string): string {
  * keyring writes (no prompts, no "repeated wallet access" warnings).
  * When the keyring is locked/unreachable the token is kept in the
  * encrypted file instead of leaving a dead `wallet:v1:` marker behind.
+ *
+ * `waitSec` = how long a keyring write may wait for an interactive
+ * wallet unlock. Interactive callers (login) pass UNLOCK_WAIT_S so the
+ * user can answer the KWallet prompt; load-time migration/repair passes
+ * 0 so a locked wallet never delays startup.
  */
-function persist(data: StoreData, forceStore = false): void {
+function persist(data: StoreData, forceStore = false, waitSec = 0): void {
   const mode = storeMode();
   const accounts: Record<string, AccountRecord> = {};
   const nowPlaintext: Record<string, string> = {};
@@ -189,7 +207,7 @@ function persist(data: StoreData, forceStore = false): void {
     let stored: string;
     if (changed && a.accessToken) {
       // Single keyring roundtrip (delete matching items + create).
-      const r = mode === "wallet" ? walletUpsert(recAttrs(a, k), a.accessToken) : null;
+      const r = mode === "wallet" ? walletUpsert(recAttrs(a, k), a.accessToken, waitSec) : null;
       stored = r === "ok" ? WALLET_PREFIX + k : encryptToken(a.accessToken);
     } else if (diskStored) {
       stored = diskStored; // unchanged: keep the existing marker/envelope
@@ -228,6 +246,7 @@ export function loadStore(): StoreData {
   // plaintext tokens that absorb decrypts into the same objects.
   diskData = raw.accounts && typeof raw.accounts === "object" ? JSON.parse(JSON.stringify(raw)) : null;
   keyringUnavailableAtLoad = false;
+  loadFailedKeys = [];
   const data: StoreData = { accounts: {} };
   let migrated = false;
 
@@ -237,9 +256,11 @@ export function loadStore(): StoreData {
       const got = walletLookup(recAttrs(rec, key));
       if (got === null) {
         // keyring locked/cleared: keep the marker on disk, run this
-        // process without the token, and flag it for the status output.
+        // process without the token, and flag it for the status output
+        // and for retryKeyringLoad().
         rec.accessToken = "";
         keyringUnavailableAtLoad = true;
+        loadFailedKeys.push(key);
       } else {
         rec.accessToken = got;
       }
@@ -292,8 +313,49 @@ export function loadStore(): StoreData {
   return cache;
 }
 
+/**
+ * Persist after an interactive change (login): keyring writes may wait
+ * up to UNLOCK_WAIT_S for the user to answer the wallet unlock prompt.
+ */
 export function saveStore(data: StoreData): void {
-  persist(data);
+  persist(data, false, UNLOCK_WAIT_S);
+}
+
+/**
+ * Lazy recovery for tokens that could not be read on load (keyring
+ * locked): retry the lookup, throttled. Prompt-safe — a lookup never
+ * touches a locked collection, so this cannot stack unlock prompts.
+ * No-op once nothing is pending. Call it from hot paths (git gate,
+ * /auth status) so the token recovers as soon as the wallet unlocks.
+ */
+export function retryKeyringLoad(): void {
+  if (loadFailedKeys.length === 0) return;
+  const now = Date.now();
+  if (now - lastRetryAt < RETRY_THROTTLE_MS) return;
+  lastRetryAt = now;
+  const data = cache;
+  if (!data) return;
+  for (const k of [...loadFailedKeys]) {
+    const rec = data.accounts[k];
+    if (!rec || rec.accessToken) {
+      loadFailedKeys = loadFailedKeys.filter((x) => x !== k);
+      continue;
+    }
+    const got = walletLookup(recAttrs(rec, k));
+    if (got !== null) {
+      rec.accessToken = got;
+      storedPlaintext[k] = got;
+      loadFailedKeys = loadFailedKeys.filter((x) => x !== k);
+    }
+  }
+  if (loadFailedKeys.length === 0) keyringUnavailableAtLoad = false;
+}
+
+/** Where the active account's token actually lives on disk right now. */
+export function activeTokenStorage(): "keyring" | "file" {
+  const key = cache?.activeLogin;
+  const stored = key ? diskData?.accounts[key]?.accessToken : undefined;
+  return stored?.startsWith(WALLET_PREFIX) ? "keyring" : "file";
 }
 
 /** True when a `wallet:v1:` token could not be read on load (keyring

@@ -1,5 +1,5 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { loadStore, activeAccount, type StoreData } from "./store";
+import { loadStore, activeAccount, retryKeyringLoad, type StoreData } from "./store";
 import { SERVICES, type Service, type TreeEntry } from "./forge";
 import { buildDetailsText, RepoDetailsPanel } from "./details";
 import { activeService, accountName, loginWithPastedToken, removeAccount, setActiveAccount, statusDetail } from "./auth";
@@ -7,6 +7,7 @@ import { activeService, accountName, loginWithPastedToken, removeAccount, setAct
 type Ctx = ExtensionCommandContext;
 
 async function showStatus(ctx: Ctx): Promise<void> {
+  retryKeyringLoad(); // prompt-safe: recovers the token once the wallet unlocks
   const data = loadStore();
   if (Object.keys(data.accounts).length === 0) {
     ctx.ui.notify("git auth: not connected — run /auth login", "info");

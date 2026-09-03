@@ -15,10 +15,15 @@
  *     occurred" warning):
  *       * "lookup" on a locked collection returns {"locked": true} and
  *         never touches the collection;
- *       * "upsert" does delete+create in ONE D-Bus roundtrip with at most
- *         ONE explicit unlock attempt (only when a non-empty secret is
- *         actually being written);
+ *       * "upsert" does delete+create in ONE D-Bus roundtrip; when the
+ *         collection is locked and a non-empty secret is being written it
+ *         makes ONE explicit unlock attempt and then WAITS (`wait` seconds,
+ *         default 20) for an interactive unlock (KWallet dialog / tray
+ *         notification) to complete — ksecretd's Unlock call returns
+ *         immediately, so a single recheck would always lose;
  *       * delete-only ("clear" / empty secret) never unlocks.
+ * Non-interactive callers (bulk migration/repair at load) pass wait=0 and
+ * get the old instant-fallback behavior.
  *
  * Two API generations are auto-detected at runtime by introspection:
  *   - modern 0.0.1 (gnome-keyring, kwallet --secretservice):
@@ -37,6 +42,10 @@ import { join } from "node:path";
 export const STATE_DIR = join(homedir(), ".pi", "agent", "pi-git-auth");
 const PY_PATH = join(STATE_DIR, "wallet-tool.py");
 const TIMEOUT_MS = 8000;
+/** Default seconds to wait for an interactive wallet unlock on write. */
+export const UNLOCK_WAIT_S = 20;
+/** Upserts may block on an interactive unlock: give the wait room. */
+const UPSERT_TIMEOUT_MS = (UNLOCK_WAIT_S + 15) * 1000;
 
 /** Outcome of a keyring write: ok, keyring locked, or unreachable. */
 export type WalletResult = "ok" | "locked" | "unreachable";
@@ -54,7 +63,9 @@ const PY = `#!/usr/bin/env python3
 
 Protocol: one JSON request on stdin, one JSON response line on stdout.
   {"cmd": "available"}
-  {"cmd": "upsert", "attrs": {...}, "secret": "..."}   # empty secret = delete only
+  {"cmd": "upsert", "attrs": {...}, "secret": "...", "wait": 20}
+      # empty secret = delete only; wait = seconds to wait for an
+      # interactive unlock while writing (0 = never wait)
   {"cmd": "lookup", "attrs": {...}}
   {"cmd": "clear",  "attrs": {...}}
 
@@ -66,7 +77,9 @@ triggers a KWallet unlock dialog. So:
   - "lookup" on a locked collection returns {"locked": true} and never
     touches the collection;
   - "upsert" does delete+create in ONE roundtrip with at most ONE explicit
-    unlock attempt, and only when a non-empty secret is written;
+    unlock attempt, and only when a non-empty secret is written; it then
+    waits "wait" seconds for the interactive unlock to complete (ksecretd's
+    Unlock returns immediately, so one recheck is not enough);
   - delete-only never unlocks.
 This keeps the client from stacking unlock prompts, which is what makes
 kded warn "Repeated attempts to access a wallet have occurred".
@@ -74,6 +87,9 @@ kded warn "Repeated attempts to access a wallet have occurred".
 import sys
 import json
 import re
+import time
+
+UNLOCK_WAIT_S = 20.0
 
 
 def out(obj):
@@ -198,6 +214,7 @@ def main():
                 pass
 
         if cmd in ("upsert", "store", "clear"):
+            wait = max(0.0, float(req.get("wait", UNLOCK_WAIT_S)))
             paths, is_locked = find_items()
             writing = cmd != "clear" and bool(secret)
             if is_locked:
@@ -207,13 +224,20 @@ def main():
                     out({"ok": False, "locked": True,
                          "error": "keyring is locked"})
                     return
-                # writing while locked: exactly ONE unlock attempt (one
-                # prompt), then re-check.
+                # writing while locked: exactly ONE unlock attempt, then
+                # wait for the interactive unlock (KWallet dialog / tray
+                # notification, GNOME prompt) to actually complete —
+                # ksecretd's Unlock returns immediately, so a single
+                # recheck would always report "locked".
                 try:
                     dbusi.Unlock([coll])
                 except Exception:
                     pass
                 paths, is_locked = find_items()
+                deadline = time.time() + wait
+                while is_locked and time.time() < deadline:
+                    time.sleep(1)
+                    paths, is_locked = find_items()
                 if is_locked:
                     out({"ok": False, "locked": True,
                          "error": "keyring is locked"})
@@ -377,11 +401,15 @@ let lastLookupLocked = false;
  * Upsert a secret for the given attrs in ONE D-Bus roundtrip: existing
  * matching items are deleted, then (when secret is non-empty) the new item
  * is created. An empty secret deletes only (best-effort, never prompts).
- * "locked" = the keyring exists but is locked (KWallet): the token must be
- * kept in the file fallback; "unreachable" = no keyring/D-Bus at all.
+ * `waitSec` is how long to wait for an interactive unlock when the
+ * keyring is locked while writing (default UNLOCK_WAIT_S for interactive
+ * callers such as login; pass 0 for non-interactive paths so they fall
+ * back to the file instantly). "locked" = the keyring exists but is
+ * locked (KWallet): the token must be kept in the file fallback;
+ * "unreachable" = no keyring/D-Bus at all.
  */
-export function walletUpsert(attrs: Record<string, string>, secret: string): WalletResult {
-  const r = call({ cmd: "upsert", attrs, secret });
+export function walletUpsert(attrs: Record<string, string>, secret: string, waitSec = UNLOCK_WAIT_S): WalletResult {
+  const r = call({ cmd: "upsert", attrs, secret, wait: waitSec }, UPSERT_TIMEOUT_MS);
   if (!r) return "unreachable";
   if (r.ok) return "ok";
   if (r.locked) return "locked";

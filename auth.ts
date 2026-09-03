@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { loadStore, saveStore, maskToken, activeAccount, accountKey, purgeAccountStorage, storeBackend, keyringUnavailableAtLoadFlag, type StoreData } from "./store";
+import { loadStore, saveStore, maskToken, activeAccount, accountKey, purgeAccountStorage, storeBackend, activeTokenStorage, keyringUnavailableAtLoadFlag, type StoreData } from "./store";
 import { SERVICES, type Platform, type Service } from "./forge";
 
 /** The subset of ctx.ui the auth flows need. */
@@ -134,9 +134,16 @@ export function statusDetail(data: StoreData): string {
   if (activeKey) lines.push("");
   const backend = storeBackend() === "keyring" ? "OS keyring (Secret Service)" : "encrypted file";
   const kwLocked = storeBackend() === "keyring" && keyringUnavailableAtLoadFlag();
-  lines.push(`Store: ${backend}${kwLocked ? " (locked/unreachable on load)" : ""}`);
-  if (activeKey) lines.push("");
   const active = activeKey ? data.accounts[activeKey] : undefined;
+  let storeLine = `Store: ${backend}`;
+  if (storeBackend() === "keyring") {
+    if (!active?.accessToken && kwLocked) {
+      storeLine += " (wallet locked on load — token unavailable)";
+    } else if (active?.accessToken && activeTokenStorage() === "file") {
+      storeLine += " (active token in encrypted file — wallet was locked at save)";
+    }
+  }
+  lines.push(storeLine);
   if (active && activeKey) {
     lines.push("");
     lines.push(`Active: @${active.user ?? activeKey.slice(activeKey.indexOf(":") + 1)}  (${active.platform})`);

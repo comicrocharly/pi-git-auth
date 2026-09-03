@@ -166,15 +166,22 @@ absolute minimum:
 - **Store is a single roundtrip** (delete matching items + create the new
   one, at most one unlock attempt) and only runs when a token actually
   changed. `/auth switch`, `status`, and plain git use perform **zero**
-  keyring writes.
-- **When the wallet is locked (or the keyring is otherwise unreachable)
-  while writing**, the token is transparently kept in the encrypted file
-  instead of leaving a dead `wallet:v1:` marker — the token stays
-  available. Once the wallet unlocks, the next token change moves it back
-  into the keyring.
-- If the wallet is locked when pi starts, the in-memory token is empty for
-  that session (git auth is disabled meanwhile) and `/auth status` says so
-  explicitly instead of showing a bare `(none)`.
+  keyring writes. On an interactive save (login) the client **waits up to
+  20 s for the unlock prompt to be answered** — `ksecretd`'s `Unlock` call
+  returns immediately, so without the wait the token would silently fall
+  back to the file every time the wallet happens to be locked.
+- **When the wallet is still locked (or the keyring is otherwise
+  unreachable) after the wait**, the token is transparently kept in the
+  encrypted file instead of leaving a dead `wallet:v1:` marker — the token
+  stays available. Once the wallet unlocks, the token moves back into the
+  keyring on the next load.
+- If the wallet is locked when pi starts, the in-memory token is empty
+  (git auth is disabled meanwhile) and `/auth status` says so explicitly
+  instead of showing a bare `(none)`. The lookup is retried automatically
+  (throttled, prompt-safe) on the next `/auth status` or git-gate hit, so
+  the token recovers as soon as the wallet unlocks — no re-login needed.
+- `/auth status` reports where the active token **actually** lives
+  (keyring vs. encrypted file), not just which backend was selected.
 
 ### Encrypted file (fallback)
 When python3 / D-Bus / a keyring are unavailable (headless server, no
