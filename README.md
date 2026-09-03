@@ -138,9 +138,11 @@ available; the extension picks one at load time.
 ### OS keyring (preferred)
 The token lives in the session keyring, addressed by the
 [freedesktop Secret Service API](https://specifications.freedesktop.org/secret-service/)
-(`org.freedesktop.secrets` over D-Bus). This covers KWallet (via
-`ksecretd`), GNOME Keyring, KeePassXC, and any other Secret Service
-provider.
+(`org.freedesktop.secrets` over D-Bus). Any provider that implements
+that API over D-Bus is targeted: KWallet (via `ksecretd`) is the one
+verified end-to-end (including the interactive unlock dialog); GNOME
+Keyring and KeePassXC are covered by the same generic code path but
+have not been tested.
 
 - The embedded python3 client (a small script that `keyring.ts` keeps
   in sync in the state dir) opens a D-Bus session and talks
@@ -163,13 +165,19 @@ absolute minimum:
 - **Lookup never prompts.** A read on a locked collection returns
   `locked` without touching the collection — no stacked prompts, no kded
   "Repeated attempts to access a wallet have occurred" warning.
-- **Store is a single roundtrip** (delete matching items + create the new
-  one, at most one unlock attempt) and only runs when a token actually
+- **Interactive unlock uses the Secret Service Prompt protocol.**
+  `Service.Unlock()` on a locked `ksecretd` collection returns a Prompt
+  object; the "KDE Wallet Service" password dialog is only shown once the
+  client calls `Prompt.Prompt()` on that object. The client does both:
+  trigger the dialog, then poll the collection's `Locked` property until it
+  actually opens (or the wait expires).
+- **Store is a single roundtrip** (create the new item + delete any older
+  matches, at most one unlock attempt) and only runs when a token actually
   changed. `/auth switch`, `status`, and plain git use perform **zero**
   keyring writes. On an interactive save (login) the client **waits up to
-  20 s for the unlock prompt to be answered** — `ksecretd`'s `Unlock` call
-  returns immediately, so without the wait the token would silently fall
-  back to the file every time the wallet happens to be locked.
+  20 s for the unlock prompt to be answered** — without the wait the token
+  would silently fall back to the file every time the wallet happens to be
+  locked.
 - **When the wallet is still locked (or the keyring is otherwise
   unreachable) after the wait**, the token is transparently kept in the
   encrypted file instead of leaving a dead `wallet:v1:` marker — the token

@@ -132,16 +132,19 @@ export function statusDetail(data: StoreData): string {
   }
   const activeKey = data.activeLogin;
   if (activeKey) lines.push("");
-  const backend = storeBackend() === "keyring" ? "OS keyring (Secret Service)" : "encrypted file";
-  const kwLocked = storeBackend() === "keyring" && keyringUnavailableAtLoadFlag();
+  const backendIsKeyring = storeBackend() === "keyring";
+  const kwLocked = backendIsKeyring && keyringUnavailableAtLoadFlag();
   const active = activeKey ? data.accounts[activeKey] : undefined;
-  let storeLine = `Store: ${backend}`;
-  if (storeBackend() === "keyring") {
-    if (!active?.accessToken && kwLocked) {
-      storeLine += " (wallet locked on load — token unavailable)";
-    } else if (active?.accessToken && activeTokenStorage() === "file") {
-      storeLine += " (active token in encrypted file — wallet was locked at save)";
-    }
+  let storeLine = backendIsKeyring
+    ? "Store: OS keyring (Secret Service)"
+    : "Store: encrypted file (fallback)";
+  if (!backendIsKeyring) {
+    storeLine +=
+      process.env.PI_GIT_AUTH_STORE?.toLowerCase() === "file"
+        ? " — forced by PI_GIT_AUTH_STORE=file"
+        : " — keyring unavailable";
+  } else if (!active?.accessToken && kwLocked) {
+    storeLine += " (wallet locked on load — token unavailable)";
   }
   lines.push(storeLine);
   if (active && activeKey) {
@@ -150,6 +153,15 @@ export function statusDetail(data: StoreData): string {
     if (!active.accessToken && kwLocked) {
       lines.push(
         "Token: (none) — keyring locked: the token is stored in the keyring and is available again once the wallet unlocks (git auth is disabled meanwhile)"
+      );
+    } else if (active.accessToken) {
+      const inKeyring = backendIsKeyring && activeTokenStorage() === "keyring";
+      lines.push(
+        inKeyring
+          ? `Token: ${maskToken(active.accessToken)}  (stored in OS keyring)`
+          : `Token: ${maskToken(active.accessToken)}  (stored in encrypted file${
+              backendIsKeyring ? " — wallet was locked at save" : ""
+            })`,
       );
     } else {
       lines.push(`Token: ${maskToken(active.accessToken)}`);

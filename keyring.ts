@@ -9,18 +9,22 @@
  * a process argument list — only in the parent process's memory.
  *
  * KWallet/ksecretd (KDE Plasma) notes:
- *   - ksecretd triggers a KWallet unlock dialog for every D-Bus operation
- *     on a LOCKED collection. To keep this from stacking prompts (and
- *     tripping kded's "Repeated attempts to access a wallet have
- *     occurred" warning):
+ *   ksecretd implements the Secret Service "Prompt" protocol: calling
+ *   Service.Unlock() on a locked collection returns a Prompt object, and
+ *   the unlock dialog (the real "KDE Wallet Service" password dialog,
+ *   shown by ksecretd itself) only appears when the client then calls
+ *   Prompt.Prompt(window_id) on it. We do exactly that (with an empty
+ *   window id — headless) and then wait `wait` seconds (default 20) for
+ *   the collection to actually unlock:
  *       * "lookup" on a locked collection returns {"locked": true} and
- *         never touches the collection;
- *       * "upsert" does delete+create in ONE D-Bus roundtrip; when the
+ *         never touches the collection (no prompt — reads happen in the
+ *         background during git operations);
+ *       * "upsert" creates the new item (with its secret) FIRST and only
+ *         then deletes the previously matched ones — kill-safe: an
+ *         interrupted upsert never destroys the keyring copy; when the
  *         collection is locked and a non-empty secret is being written it
- *         makes ONE explicit unlock attempt and then WAITS (`wait` seconds,
- *         default 20) for an interactive unlock (KWallet dialog / tray
- *         notification) to complete — ksecretd's Unlock call returns
- *         immediately, so a single recheck would always lose;
+ *         triggers ONE interactive unlock (Service.Unlock + Prompt) and
+ *         waits for it to complete;
  *       * delete-only ("clear" / empty secret) never unlocks.
  * Non-interactive callers (bulk migration/repair at load) pass wait=0 and
  * get the old instant-fallback behavior.
@@ -72,16 +76,19 @@ Protocol: one JSON request on stdin, one JSON response line on stdout.
 Auto-detects the Secret Service API generation (modern 0.0.1 vs legacy
 0.0.0/ksecretd) by introspecting the service.
 
-KWallet/ksecretd (KDE) note: every D-Bus operation on a LOCKED collection
-triggers a KWallet unlock dialog. So:
+KWallet/ksecretd (KDE) note: ksecretd implements the Secret Service Prompt
+protocol. Service.Unlock() on a locked collection returns a Prompt object;
+the "KDE Wallet Service" password dialog (shown by ksecretd itself) only
+appears once the client calls Prompt.Prompt() on it. We do that (empty
+window id — we are headless) and then wait "wait" seconds for the
+collection to actually unlock.
   - "lookup" on a locked collection returns {"locked": true} and never
-    touches the collection;
+    touches the collection (no prompt);
   - "upsert" creates the new item (with its secret) FIRST and only then
-    deletes the previously matched ones — kill-safe: an interrupted upsert
-    never destroys the keyring copy; at most ONE explicit unlock attempt,
-    and only when a non-empty secret is written; it then waits "wait"
-    seconds for the interactive unlock to complete (ksecretd's Unlock
-    returns immediately, so one recheck is not enough);
+    deletes the previously matched ones — kill-safe: an interrupted
+    upsert never destroys the keyring copy; when locked and a non-empty
+    secret is written it triggers ONE interactive unlock (Service.Unlock
+    + Prompt.Prompt) and waits for it;
   - delete-only never unlocks.
 This keeps the client from stacking unlock prompts, which is what makes
 kded warn "Repeated attempts to access a wallet have occurred".
@@ -178,6 +185,46 @@ def main():
             ))
             return [str(k) for k in list(u)], bool(locked)
 
+        def is_locked_now():
+            """Authoritative collection lock state, via the Locked
+            property. (SearchItems only reports locking through items that
+            match the query — a locked collection with NO matching items
+            would otherwise look unlocked!)"""
+            if MODERN:
+                return False
+            try:
+                return bool(dbus.Interface(
+                    bus.get_object(owner, str(coll)),
+                    "org.freedesktop.DBus.Properties",
+                ).Get("org.freedesktop.Secret.Collection", "Locked"))
+            except Exception:
+                return bool(find_items()[1])
+
+        def unlock_with_prompt():
+            """Trigger ksecretd's interactive unlock flow. Service.Unlock()
+            returns (unlocked collections, prompt object path); the dialog
+            is only shown once Prompt.Prompt(window_id) is called on that
+            object — and it is shown by ksecretd itself, so it survives
+            this process exiting."""
+            if MODERN:
+                return  # modern (0.0.1) API has no locking
+            try:
+                res = dbusi.Unlock([dbus.ObjectPath(str(coll))])
+                prompt = str(res[1]) if res and len(res) > 1 else "/"
+            except Exception:
+                return
+            if prompt and prompt != "/":
+                try:
+                    piface = dbus.Interface(
+                        bus.get_object(owner, prompt),
+                        "org.freedesktop.Secret.Prompt",
+                    )
+                    # Empty window id: ksecretd still shows the dialog,
+                    # unparented, kept above all windows.
+                    piface.Prompt("")
+                except Exception:
+                    pass
+
         def get_content(path):
             """Return the secret bytes for an item path, or None."""
             try:
@@ -218,6 +265,7 @@ def main():
         if cmd in ("upsert", "store", "clear"):
             wait = max(0.0, float(req.get("wait", UNLOCK_WAIT_S)))
             paths, is_locked = find_items()
+            is_locked = is_locked_now() or is_locked
             writing = cmd != "clear" and bool(secret)
             if is_locked:
                 if not writing:
@@ -226,24 +274,27 @@ def main():
                     out({"ok": False, "locked": True,
                          "error": "keyring is locked"})
                     return
-                # writing while locked: exactly ONE unlock attempt, then
-                # wait for the interactive unlock (KWallet dialog / tray
-                # notification, GNOME prompt) to actually complete —
-                # ksecretd's Unlock returns immediately, so a single
-                # recheck would always report "locked".
-                try:
-                    dbusi.Unlock([coll])
-                except Exception:
+                if wait <= 0:
+                    # Non-interactive caller: NEVER prompt. Fall through to
+                    # the write attempt below — it may still succeed if the
+                    # wallet is being unlocked in parallel; otherwise the
+                    # IsLocked D-Bus error is caught below and reported as
+                    # "locked".
                     pass
-                paths, is_locked = find_items()
-                deadline = time.time() + wait
-                while is_locked and time.time() < deadline:
-                    time.sleep(1)
+                else:
+                    # Writing while locked: trigger the interactive unlock
+                    # (Service.Unlock + Prompt — ksecretd shows the "KDE
+                    # Wallet Service" password dialog) and wait for the
+                    # collection to actually unlock.
+                    unlock_with_prompt()
+                    deadline = time.time() + wait
+                    while is_locked_now() and time.time() < deadline:
+                        time.sleep(1)
+                    if is_locked_now():
+                        out({"ok": False, "locked": True,
+                             "error": "keyring is locked"})
+                        return
                     paths, is_locked = find_items()
-                if is_locked:
-                    out({"ok": False, "locked": True,
-                         "error": "keyring is locked"})
-                    return
             if cmd == "clear" or not secret:
                 for path in paths:
                     item_delete(path)
@@ -316,16 +367,32 @@ def main():
                         ),
                 }, "sv")
                 create_res = coll_obj.CreateItem(props, secret_arg, True)
-                if create_res and len(create_res) > 1:
-                    new_path = str(create_res[1])
-            for path in paths:
-                if path == new_path:
-                    continue
-                item_delete(path)
+                # ksecretd returns (item_path, prompt) — the item comes
+                # FIRST (the 0.0.1 spec says (session, item)); scan the
+                # whole reply for a path under this collection instead of
+                # trusting a fixed index.
+                for cand in (
+                    create_res if isinstance(create_res, tuple) else ()
+                ):
+                    s = str(cand)
+                    if s.startswith(str(coll) + "/"):
+                        new_path = s
+                        break
+            if new_path:
+                for path in paths:
+                    if path != new_path:
+                        item_delete(path)
+            # else: can't tell which pre-matched item was updated in place —
+            # keep them all (orphans are harmless); deleting blindly would
+            # destroy the copy we just wrote.
             out({"ok": True})
             return
 
         if cmd == "lookup":
+            if is_locked_now():
+                out({"ok": False, "locked": True,
+                     "error": "keyring is locked"})
+                return
             paths, is_locked = find_items()
             for path in paths:
                 content = get_content(path)
@@ -346,10 +413,18 @@ def main():
 
         out({"ok": False, "error": "unknown command"})
     except Exception as e:
+        name = ""
+        try:
+            name = e.get_dbus_name() or ""  # D-Bus error name (python-dbus)
+        except Exception:
+            pass
         msg = str(e)
         if secret:
             msg = msg.replace(secret, "***")
-        out({"ok": False, "error": msg or e.__class__.__name__})
+        if "IsLocked" in name or "IsLocked" in msg:
+            out({"ok": False, "locked": True, "error": "keyring is locked"})
+        else:
+            out({"ok": False, "error": msg or e.__class__.__name__})
 
 
 main()
