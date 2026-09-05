@@ -3,6 +3,7 @@ import { loadStore, activeAccount, retryKeyringLoad, type StoreData } from "./st
 import { SERVICES, type Service, type TreeEntry } from "./forge";
 import { buildDetailsText, RepoDetailsPanel } from "./details";
 import { activeService, accountName, loginWithPastedToken, removeAccount, setActiveAccount, statusDetail } from "./auth";
+import { detectCredHelperSink } from "./git-helpers";
 
 type Ctx = ExtensionCommandContext;
 
@@ -12,7 +13,8 @@ async function showStatus(ctx: Ctx): Promise<void> {
   if (Object.keys(data.accounts).length === 0) {
     ctx.ui.notify("git auth: not connected — run /auth login", "info");
   } else {
-    ctx.ui.notify(statusDetail(data), "info");
+    const sink = await detectCredHelperSink(); // cached, fail-silent
+    ctx.ui.notify(statusDetail(data, { credHelperSink: sink }), "info");
   }
 }
 

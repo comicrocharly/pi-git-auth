@@ -54,6 +54,7 @@ github.ts    GitHub REST client
 gitlab.ts    GitLab REST client
 details.ts   read-only repo details overlay (tree + commits + metadata)
 git-gate.ts  command rewriting that injects the token for a host
+git-helpers.ts detection of file-persisting credential helpers (status note)
 redact.ts    secret redaction of tool outputs (PAT / URL-credential patterns)
 ```
 
@@ -121,14 +122,27 @@ use that account's token for the account's host (`github.com` or
 
 ```
 export GIT_TERMINAL_PROMPT=0 \
-  GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_COUNT=2 \
   GIT_CONFIG_KEY_0="url.https://x-access-token:<token>@<host>/.insteadOf" \
-  GIT_CONFIG_VALUE_0="https://<host>/" && <command>
+  GIT_CONFIG_VALUE_0="https://<host>/" \
+  GIT_CONFIG_KEY_1="credential.helper" \
+  GIT_CONFIG_VALUE_1="" && <command>
 ```
 
 Forging hosts' git-over-HTTPS endpoints ignore `Authorization` headers
 and only accept URL-embedded credentials, hence the `insteadOf` rewrite.
 Only the active host is touched; other remotes are untouched.
+
+The empty `credential.helper` entry disables git's credential helpers for
+the instrumented process only (env config is read after all file configs,
+and an empty value clears previously defined helpers). This is required so
+that git's post-auth store phase does not persist the injected token — e.g.
+a user-configured `credential.helper = store` would otherwise write it
+plaintext to `~/.git-credentials`. All other standard auth mechanisms
+(URL-embedded credentials, `credential.<url>.*` config, `.netrc`, SSH) are
+unaffected; helpers remain fully active everywhere the gate does not run.
+If a file-persisting helper is detected in the user's config, `/auth
+status` notes it passively (one line, no prompt).
 
 ## Token storage
 

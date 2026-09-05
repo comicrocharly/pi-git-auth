@@ -6,9 +6,11 @@
  * for that host, regardless of git's own credential configuration:
  *
  *   export GIT_TERMINAL_PROMPT=0 \
- *     GIT_CONFIG_COUNT=1 \
+ *     GIT_CONFIG_COUNT=2 \
  *     GIT_CONFIG_KEY_0="url.https://x-access-token:<token>@<host>/.insteadOf" \
- *     GIT_CONFIG_VALUE_0="https://<host>/" && <command>
+ *     GIT_CONFIG_VALUE_0="https://<host>/" \
+ *     GIT_CONFIG_KEY_1="credential.helper" \
+ *     GIT_CONFIG_VALUE_1="" && <command>
  *
  * Forging hosts' git-over-HTTPS endpoints ignore Authorization headers
  * and only accept URL-embedded (Basic) credentials, hence the insteadOf
@@ -19,6 +21,14 @@
  *  - GIT_TERMINAL_PROMPT=0: a failed auth surfaces as a clean error
  *    instead of an interactive prompt hanging the TUI.
  *  - Deterministic: no credential-helper races, same behavior every run.
+ *  - The token is never persisted by git's credential helpers: the empty
+ *    credential.helper entry (read after all file configs, where an empty
+ *    value clears previously defined helpers) disables helpers for the
+ *    instrumented process only. Without it, git's post-auth store phase
+ *    would hand the injected token to file-based helpers such as `store`,
+ *    persisting it plaintext to ~/.git-credentials. All other standard
+ *    auth mechanisms (URL-embedded credentials, credential.<url>.* config,
+ *    .netrc, SSH) are unaffected.
  *  - SSH-style URLs for the host are rewritten to HTTPS so the token applies.
  */
 
@@ -37,8 +47,10 @@ export function instrumentGit(command: string, host: string, token: string): str
     .replace(new RegExp(`git@${host}:`, "g"), `https://${host}/`);
   const prefix =
     `export GIT_TERMINAL_PROMPT=0 ` +
-    `GIT_CONFIG_COUNT=1 ` +
+    `GIT_CONFIG_COUNT=2 ` +
     `GIT_CONFIG_KEY_0="url.https://x-access-token:${token}@${host}/.insteadOf" ` +
-    `GIT_CONFIG_VALUE_0="https://${host}/" && `;
+    `GIT_CONFIG_VALUE_0="https://${host}/" ` +
+    `GIT_CONFIG_KEY_1="credential.helper" ` +
+    `GIT_CONFIG_VALUE_1="" && `;
   return prefix + rewritten;
 }

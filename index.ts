@@ -5,6 +5,7 @@ import { loadStore, activeAccount, retryKeyringLoad } from "./store";
 import { SERVICES } from "./forge";
 import { findAccounts, setActiveAccount, statusDetail } from "./auth";
 import { instrumentGit } from "./git-gate";
+import { detectCredHelperSink } from "./git-helpers";
 import { redactSecrets } from "./redact";
 import { handleAuthCommand } from "./commands";
 
@@ -90,7 +91,8 @@ export default function (pi: ExtensionAPI) {
           retryKeyringLoad(); // prompt-safe: recovers the token once the wallet unlocks
           const data = loadStore();
           if (Object.keys(data.accounts).length === 0) return { ...text(notConnected), isError: true };
-          return text(statusDetail(data));
+          const sink = await detectCredHelperSink(); // cached, fail-silent
+          return text(statusDetail(data, { credHelperSink: sink }));
         }
 
         case "switch": {

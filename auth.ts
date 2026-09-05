@@ -117,7 +117,7 @@ export function activeService(data: StoreData): Service | undefined {
 }
 
 /** Human-readable status block: all accounts, details for the active one. */
-export function statusDetail(data: StoreData): string {
+export function statusDetail(data: StoreData, opts?: { credHelperSink?: { helper: string; target: string } }): string {
   const keys = Object.keys(data.accounts);
   if (keys.length === 0) return "No git accounts. Run /auth login.";
   const lines = ["Git accounts:"];
@@ -147,6 +147,11 @@ export function statusDetail(data: StoreData): string {
     storeLine += " (wallet locked on load — token unavailable)";
   }
   lines.push(storeLine);
+  if (opts?.credHelperSink) {
+    lines.push(
+      `Git: credential.helper=${opts.credHelperSink.helper} detected — git may also cache gate tokens in ${opts.credHelperSink.target} (the gate itself keeps the token keyring-only)`,
+    );
+  }
   if (active && activeKey) {
     lines.push("");
     lines.push(`Active: @${active.user ?? activeKey.slice(activeKey.indexOf(":") + 1)}  (${active.platform})`);
