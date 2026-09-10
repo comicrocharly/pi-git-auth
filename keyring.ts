@@ -24,7 +24,8 @@
  *         interrupted upsert never destroys the keyring copy; when the
  *         collection is locked and a non-empty secret is being written it
  *         triggers ONE interactive unlock (Service.Unlock + Prompt) and
- *         waits for it to complete;
+ *         waits for it to complete (Prompt.Completed signal — a user
+ *         cancel is detected and reported as such — or timeout);
  *       * delete-only ("clear" / empty secret) never unlocks.
  * Non-interactive callers (bulk migration/repair at load) pass wait=0 and
  * get the old instant-fallback behavior.
@@ -85,10 +86,12 @@ collection to actually unlock.
   - "lookup" on a locked collection returns {"locked": true} and never
     touches the collection (no prompt);
   - "upsert" creates the new item (with its secret) FIRST and only then
-    deletes the previously matched ones — kill-safe: an interrupted
+    deletes the previously matched ones, each re-verified to still carry
+    our exact attributes before deletion — kill-safe: an interrupted
     upsert never destroys the keyring copy; when locked and a non-empty
     secret is written it triggers ONE interactive unlock (Service.Unlock
-    + Prompt.Prompt) and waits for it;
+    + Prompt.Prompt) and waits for the Prompt.Completed signal (a user
+    cancel is reported as such) or timeout;
   - delete-only never unlocks.
 This keeps the client from stacking unlock prompts, which is what makes
 kded warn "Repeated attempts to access a wallet have occurred".
@@ -131,8 +134,21 @@ def main():
     try:
         owner = bus.get_name_owner(SVC)
     except Exception:
-        out({"ok": False, "error": "no keyring service on session bus"})
-        return
+        owner = None
+    if owner is None:
+        # No owner yet — the service may be D-Bus ACTIVATABLE and simply
+        # not started: a light Introspect call both triggers activation
+        # and confirms presence; NameHasNoOwner on the call = truly
+        # absent.
+        try:
+            dbus.Interface(
+                bus.get_object(SVC, "/org/freedesktop/secrets"),
+                "org.freedesktop.DBus.Introspectable",
+            ).Introspect()
+            owner = bus.get_name_owner(SVC)
+        except Exception:
+            out({"ok": False, "error": "no keyring service on session bus"})
+            return
 
     svc = bus.get_object(SVC, "/org/freedesktop/secrets")
     dbusi = dbus.Interface(svc, "org.freedesktop.Secret.Service")
@@ -156,11 +172,20 @@ def main():
             attrs.get("login", "?"),
         )
 
-        # open a plaintext session
-        if MODERN:
-            _o, session = dbusi.OpenSession("none", "")
-        else:
-            _o, session = dbusi.OpenSession("plain", "")
+        # open a plaintext session. Algorithm support differs per backend
+        # (ksecretd historically "plain", gnome-keyring "none"): try the
+        # generation's preference first, fall back to the other.
+        session = None
+        for algo in (("none", "plain") if MODERN else ("plain", "none")):
+            try:
+                _o, session = dbusi.OpenSession(algo, "")
+                break
+            except Exception:
+                session = None
+        if session is None:
+            out({"ok": False, "error": "OpenSession failed"})
+            return
+        if not MODERN:
             coll = dbusi.ReadAlias("default")
             if str(coll) == "/":
                 out({"ok": False, "error": "no default collection in keyring"})
@@ -205,14 +230,15 @@ def main():
             returns (unlocked collections, prompt object path); the dialog
             is only shown once Prompt.Prompt(window_id) is called on that
             object — and it is shown by ksecretd itself, so it survives
-            this process exiting."""
+            this process exiting. Returns the prompt object path ("" when
+            none), which the caller races against Prompt.Completed."""
             if MODERN:
-                return  # modern (0.0.1) API has no locking
+                return ""  # modern (0.0.1) API has no locking
             try:
                 res = dbusi.Unlock([dbus.ObjectPath(str(coll))])
-                prompt = str(res[1]) if res and len(res) > 1 else "/"
+                prompt = str(res[1]) if res and len(res) > 1 else ""
             except Exception:
-                return
+                return ""
             if prompt and prompt != "/":
                 try:
                     piface = dbus.Interface(
@@ -222,8 +248,10 @@ def main():
                     # Empty window id: ksecretd still shows the dialog,
                     # unparented, kept above all windows.
                     piface.Prompt("")
+                    return prompt
                 except Exception:
-                    pass
+                    return ""
+            return ""
 
         def get_content(path):
             """Return the secret bytes for an item path, or None."""
@@ -253,7 +281,47 @@ def main():
             except Exception:
                 return None
 
+        def order_paths(paths):
+            """Deterministic newest-first order for duplicate items, plus
+            dedup. ksecretd names created items "Entry N" (N grows), so
+            the LARGEST numeric suffix in the last path segment is the
+            most recent; items without a suffix sort by path. Search
+            results are unordered — this makes lookup stable."""
+            seen, out = set(), []
+            for p in paths:
+                s = str(p)
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            def key(p):
+                seg = p.rsplit("/", 1)[-1]
+                i = len(seg)
+                while i > 0 and seg[i - 1].isdigit():
+                    i -= 1
+                num = int(seg[i:]) if i < len(seg) else None
+                # newest first: descending numeric suffix, then path
+                return (num is None, -(num or 0), p)
+            return sorted(out, key=key)
+
         def item_delete(path):
+            # Verified delete: never destroy an item that does not (any
+            # more) carry our exact attribute set. Modern (0.0.1) items
+            # expose Attributes — re-read them before deleting, and on
+            # ANY doubt (property gone, mismatch, any error) the item is
+            # kept. Legacy (0.0.0) items have no properties, but
+            # ksecretd's SearchItems matches (app, platform, login)
+            # exactly, so its results are ours by construction.
+            if MODERN:
+                try:
+                    a = dict(dbus.Interface(
+                        bus.get_object(owner, path),
+                        "org.freedesktop.DBus.Properties",
+                    ).Get("org.freedesktop.Secret.Item", "Attributes"))
+                    for k in ("app", "platform", "login"):
+                        if str(a.get(k)) != str(attrs.get(k)):
+                            return
+                except Exception:
+                    return
             try:
                 dbus.Interface(
                     bus.get_object(owner, path),
@@ -286,10 +354,42 @@ def main():
                     # (Service.Unlock + Prompt — ksecretd shows the "KDE
                     # Wallet Service" password dialog) and wait for the
                     # collection to actually unlock.
-                    unlock_with_prompt()
+                    prompt = unlock_with_prompt()
                     deadline = time.time() + wait
+                    cancelled = False
                     while is_locked_now() and time.time() < deadline:
-                        time.sleep(1)
+                        # Poll for Prompt.Completed: it arrives the moment
+                        # the user acts, and its code distinguishes
+                        # success (0) from CANCEL — pure polling cannot
+                        # tell the two apart.
+                        try:
+                            msg = bus.recv(timeout=0.25)
+                        except Exception:
+                            msg = None
+                        if msg is not None and prompt:
+                            try:
+                                if (
+                                    msg.is_signal_message()
+                                    and msg.get_interface()
+                                    == "org.freedesktop.Secret.Prompt"
+                                    and msg.get_member() == "Completed"
+                                    and str(msg.get_path()) == prompt
+                                ):
+                                    args = msg.get_args_list()
+                                    cancelled = int(args[0]) != 0
+                                    break
+                            except Exception:
+                                pass
+                    if is_locked_now():
+                        # Small grace: Completed can arrive a hair before
+                        # the Locked property flips.
+                        grace = time.time() + 2
+                        while is_locked_now() and time.time() < grace:
+                            time.sleep(0.2)
+                    if cancelled:
+                        out({"ok": False, "locked": True,
+                             "error": "keyring unlock was cancelled"})
+                        return
                     if is_locked_now():
                         out({"ok": False, "locked": True,
                              "error": "keyring is locked"})
@@ -304,7 +404,8 @@ def main():
             # then delete the previously matched items. Even if this process
             # is killed mid-upsert the keyring copy is never destroyed
             # (worst case: orphan items remain; the next upsert cleans them
-            # up, and lookups take the first non-empty secret).
+            # up, and lookups take the NEWEST non-empty secret —
+            # deterministic order via order_paths).
             new_path = ""
             if MODERN:
                 item = "/org/freedesktop/secrets/0/item/" + re.sub(
@@ -313,36 +414,34 @@ def main():
                         attrs.get("login", "x"),
                     )
                 )
-                item_props = dbus.Struct((
-                    dbus.ObjectPath(item),
-                    dbus.Dictionary({
-                        "org.freedesktop.Secret.Item.Label": dbus.ByteArray(
-                            label.encode("utf-8")
+                # 0.0.1 Store: items = {item path -> session path},
+                # secrets = {item path -> properties}, where the ONE
+                # properties map holds BOTH the item properties and the
+                # secret properties (per spec). Storing at an existing
+                # path UPDATES the item — that is the upsert.
+                item_props = dbus.Dictionary({
+                    "org.freedesktop.Secret.Item.Label": dbus.ByteArray(
+                        label.encode("utf-8")
+                    ),
+                    "org.freedesktop.Secret.Item.Attributes":
+                        dbus.Dictionary(
+                            {k: v for k, v in attrs.items()}, "sv"
                         ),
-                        "org.freedesktop.Secret.Item.Attributes":
-                            dbus.Dictionary(
-                                {k: v for k, v in attrs.items()}, "sv"
-                            ),
-                    }, "sv"),
-                ))
-                secret_props = dbus.Struct((
-                    dbus.ObjectPath(item),
-                    dbus.Dictionary({
-                        "org.freedesktop.Secret.Secret.Value": dbus.ByteArray(
-                            secret.encode("utf-8")
-                        ),
-                        "org.freedesktop.Secret.Secret.Content-Type":
-                            "application/octet-stream",
-                        "org.freedesktop.Secret.Secret.Parameters":
-                            dbus.Dictionary({}, "sv"),
-                    }, "sv"),
-                ))
+                    "org.freedesktop.Secret.Secret.Value": dbus.ByteArray(
+                        secret.encode("utf-8")
+                    ),
+                    "org.freedesktop.Secret.Secret.Content-Type":
+                        "application/octet-stream",
+                    "org.freedesktop.Secret.Secret.Parameters":
+                        dbus.Dictionary({}, "sv"),
+                }, "sv")
                 dbusi.Store(
-                    dbus.Dictionary({item: ""}, "sv"),
+                    dbus.Dictionary(
+                        {item: dbus.ObjectPath(str(session))}, "sv"
+                    ),
                     dbus.UInt32(0),
                     dbus.Dictionary(
-                        {item: dbus.Struct((item_props, secret_props))},
-                        "sv",
+                        {item: dbus.Variant(item_props)}, "sv"
                     ),
                 )
                 new_path = item
@@ -394,7 +493,7 @@ def main():
                      "error": "keyring is locked"})
                 return
             paths, is_locked = find_items()
-            for path in paths:
+            for path in order_paths(paths):
                 content = get_content(path)
                 if content:
                     out({
@@ -475,14 +574,18 @@ function call(req: Record<string, unknown>, timeoutMs = TIMEOUT_MS): WalletRes |
   }
 }
 
-let availCache: boolean | null = null;
+let availCache: { ok: boolean; at: number } | null = null;
+/** Re-probe after this long: a keyring service may start late (D-Bus
+ * activation, CI, re-login) — a permanently cached "no" would be wrong. */
+const AVAIL_TTL_MS = 60_000;
 
-/** True when a keyring (Secret Service) is reachable. Result is cached. */
+/** True when a keyring (Secret Service) is reachable. Cached (TTL). */
 export function walletAvailable(): boolean {
-  if (availCache !== null) return availCache;
+  if (availCache !== null && Date.now() - availCache.at < AVAIL_TTL_MS)
+    return availCache.ok;
   const r = call({ cmd: "available" }, 5000);
-  availCache = !!(r && r.ok);
-  return availCache;
+  availCache = { ok: !!(r && r.ok), at: Date.now() };
+  return availCache.ok;
 }
 
 let lastLookupLocked = false;
